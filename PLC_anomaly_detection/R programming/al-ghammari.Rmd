@@ -1,0 +1,320 @@
+---
+title: "masterthesis"
+author: "alghammari"
+date: "28 September 2018"
+output:
+word_document: default
+pdf_document: default
+---
+```{r setup, message=FALSE, results='hide'}
+require(plyr)
+require(corrplot)
+require(caret)
+require(doMC)
+registerDoMC(4)
+require(zoo)
+# nnet plots: https://beckmw.wordpress.com/2013/11/14/visualizing-neural-networks-in-r-update/
+require(devtools)
+source_url('https://gist.githubusercontent.com/fawda123/7471137/raw/466c1474d0a505ff044412703516c34f1a4684a5/nnet_plot_update.r')
+```
+
+```{r read data}
+# Loading the txt (or CSV) file after saving the values from MATLAB data preprocessing methods
+filedir <- 'data/'
+
+files_load <- list.files(filedir, full.names = T, pattern="*.txt")
+
+
+appliance <- list()
+appliance$emg0 <- ldply(files_load[1], read.table, sep=',', fill = T, col.names = c('appliance', paste('HF_', 1:2049, sep='')))
+
+```
+
+## Calculating the variance threshhold
+To detect the dominant behavior, start and end of each appliance, the variance over a specific window is calculated. If the value is greater than the threshold, the signal will be cut. For this purpose, we conducted the following steps:
+
+### Magnitude over all/almost SNR vectors values
+We will utilized the magnitude of all SNR vector values for each appliance values. The previous plot showed the 10 first SNR magnitude values before processing.
+
+
+```{r calculate magnitude}
+
+appliance$mag  <- as.data.frame(mapply(function(emg0) {
+  m <- sqrt(emg0^2)
+  m
+}, appliance$emg0[,2:2050]))
+matplot(t(appliance$mag[1:10,]), type='l')
+```
+
+### Calculate variance using the 50% quantile
+The data still needs more definition. Therefore, we need to calculate variance using the 50% quantile to define the necessary peaks for each appliance SNR and discard all values below this quanitle. We used the second quartile.
+
+```{r sd of each sample}
+appliance$q50 <- as.data.frame(apply(appliance$mag, 1 ,function(m) {
+  q50 <- quantile(m, na.rm = T)[[2]]
+  q50
+}))
+```
+
+### Stripping the data for all values below this quanitle
+
+```{r strip values}
+stepwidth <- 1/2049
+appliance$new_mag <- data.frame(matrix(NA, ncol = 2049))
+appliance$data <- data.frame(matrix(NA, ncol = 2050))
+
+for (i in 1:(dim(appliance$mag)[1])) {
+  # 1 remove NAs
+  mag <- appliance$mag[i,]
+  mag[is.na(mag)] <- 0
+  # 2 pre filter
+  mag <- rollapply(data = mag[!is.na(mag)], width = 10, FUN = median)
+  # 3 cut
+  start <- which.max(mag > appliance$q50[i,])
+  stop <- length(mag) - which.max(rev(mag) > appliance$q50[i,])
+  mag <- mag[start:stop]
+  start <- start + 3
+  stop <- stop + 3
+  emg0 <- appliance$emg0[i,start:stop]
+  
+  # remove NAs and apply runmed
+  emg0 <- rollapply(data = emg0[!is.na(emg0)], width = 10, FUN = median)
+  
+  # 4 linear approximation 
+  mag_approx <- approx(x = seq(0,1,1/(length(mag)-1)), y = mag, xout = seq(0,1,stepwidth), method = 'linear')$y[1:2049]
+  
+  emg0_approx <- approx(x = seq(0,1,1/(length(emg0)-1)), y = emg0, xout = seq(0,1,stepwidth), method = 'linear')$y[1:2049]
+  
+  
+  # 5 append to one line
+  appliance$new_mag[i,] <- as.data.frame(t(mag_approx))
+  appliance$emg0[i,2:2050] <- as.data.frame(t(emg0_approx))
+  
+  
+  appliance$data[i,] <- appliance$emg0[i,]
+  
+}
+matplot(t(appliance$new_mag[1:10,]), type='l')
+```
+
+
+### Feature Correlation
+We applied correlation threshold and filtered all but one feature of each group of features with correlation higher than threshold so ML algorithms can detect the exact feature of each HF SNR values for each appliance. Thus, we reduced amount of features, but kept a large portions of the information contained in the data. In other words, we  obtained less features, which still represent the same information.
+
+```{r feature correlation}
+# feature correlation as plot
+corrplot(cor(appliance$data[,2:100]), tl.cex = 0.3) # addgrid.col = NA
+# remove correlated variable using ?findCorrelation
+foundCorIndexes <- findCorrelation(cor(appliance$data))
+#foundCorIndexes
+corrplot(cor(appliance$data[,-foundCorIndexes]), tl.cex = 0.3)
+# remove the features from the data
+appliance$data <- appliance$data[,-foundCorIndexes]
+```
+
+## Data Partitioning
+
+```{r data_partitioning}
+# split into training and test data
+set.seed(1704)
+indexes_train <- createDataPartition(appliance$emg0[,1], p=0.75, list = F)
+indexes_test <- (1:nrow(appliance$data))[-indexes_train]
+
+training <- appliance$data[indexes_train,]
+training_SNR <- appliance$emg0[indexes_train,1]
+testing <- appliance$data[indexes_test,]
+testing_SNR <- appliance$emg0[indexes_test,1]
+```
+
+## Model Training
+We used 6 different classification algorithms, so we could define which algorithm could result with the best prediction accuracy. 
+
+```{r initialize models list}
+models <- list()
+```
+
+```{r specify train control}
+trControl <- trainControl(
+    method = 'repeatedcv', # none, cv, repeatedcv, LOOCV, ...
+    number = 10, # nr of CV partitions
+    repeats = 20, # nr of partitioning repetitions
+    returnData = F, 
+    returnResamp = 'final', # return CV partition results for best model
+    allowParallel = T
+)
+```
+
+### KNN
+
+```{r model training knn}
+models$knn <- train(training,
+               factor(training_SNR),
+               method = 'knn',
+               preProcess = c('center', 'scale', 'pca'),
+               metric = 'Kappa',
+               trControl = trControl
+               )
+models$knn
+```
+
+```{r predict_test_data knn}
+predicted <- predict(models$knn, newdata = testing)
+
+# to ensure, that also when one level is not predicted, the results can be displayed
+u = union(predicted, testing_SNR)
+t = table(factor(predicted, u), factor(testing_SNR, u))
+conf <- confusionMatrix(t)
+
+levelplot(sweep(conf$table, MARGIN = 2, STATS = colSums(conf$table), FUN = `/`), col.regions = gray(100:0/100), aspect="fill", scales=list( x=list(rot=45)))
+```
+
+### Linear Discriminant Analysis (LDA) 
+To compare the results, now a *lda* model with the same parameters is trained.
+
+```{r model training lda}
+models$lda <- train(training,
+               factor(training_SNR),
+               method = 'lda',
+               preProcess = c('center', 'scale', 'pca'),
+               metric = 'Kappa',
+               trControl = trControl
+               )
+models$lda
+```
+
+```{r predict_test_data lda}
+predicted <- predict(models$lda, newdata = testing)
+
+# to ensure, that also when one level is not predicted, the results can be displayed
+u = union(predicted, testing_SNR)
+t = table(factor(predicted, u), factor(testing_SNR, u))
+conf <- confusionMatrix(t)
+
+levelplot(sweep(conf$table, MARGIN = 2, STATS = colSums(conf$table), FUN = `/`), col.regions = gray(100:0/100), aspect="fill", scales=list( x=list(rot=45)))
+```
+
+### Linear Discriminant Analysis 2 (LDA2) 
+
+```{r model training lda2}
+models$lda2 <- train(training,
+               factor(training_SNR),
+               method = 'lda2',
+               preProcess = c('center', 'scale', 'pca'),
+               metric = 'Kappa',
+               trControl = trControl
+               )
+models$lda2
+```
+
+```{r predict_test_data lda2}
+predicted <- predict(models$lda2, newdata = testing)
+
+# to ensure, that also when one level is not predicted, the results can be displayed
+u = union(predicted, testing$pers)
+t = table(factor(predicted, u), factor(testing_SNR, u))
+conf <- confusionMatrix(t)
+
+levelplot(sweep(conf$table, MARGIN = 2, STATS = colSums(conf$table), FUN = `/`), col.regions = gray(100:0/100), aspect="fill", scales=list( x=list(rot=45)))
+```
+
+### Suppor Vector Machine (SVM)
+
+```{r train model svm linear}
+train_model <- function(method, tuneGrid=NULL) {
+  train(x = training, # in real life apps only use train data here!
+        y = training_SNR, # in real life apps only use train data here!
+        method = method, 
+        metric = 'Kappa', 
+        tuneGrid = tuneGrid,
+        trControl = trControl
+  )
+}
+models$svmLinear <- train_model('svmLinear', tuneGrid = expand.grid(C=3**(-5:5)))
+
+
+```
+
+
+```{r predict_test_data svm linear}
+predicted <- predict(models$svmLinear, newdata = testing)
+
+# to ensure, that also when one level is not predicted, the results can be displayed
+u = union(predicted, testing$pers)
+t = table(factor(predicted, u), factor(testing_SNR, u))
+conf <- confusionMatrix(t)
+
+levelplot(sweep(conf$table, MARGIN = 2, STATS = colSums(conf$table), FUN = `/`), col.regions = gray(100:0/100), aspect="fill", scales=list( x=list(rot=45)))
+
+```
+
+
+```{r train model svm linear}
+train_model <- function(method, tuneGrid=NULL) {
+  train(x = training, # in real life apps only use train data here!
+        y = training_SNR, # in real life apps only use train data here!
+        method = method, 
+        metric = 'Kappa', 
+        tuneGrid = tuneGrid,
+        trControl = trControl
+  )
+}
+models$svmRadial <- train_model('svmRadial', tuneGrid = expand.grid(C=3**(-5:5), sigma=3**(-5:5))) 
+
+```
+
+```{r predict_test_data svm radial}
+predicted <- predict(models$svmRadial, newdata = testing)
+
+# to ensure, that also when one level is not predicted, the results can be displayed
+u = union(predicted, testing$pers)
+t = table(factor(predicted, u), factor(testing_SNR, u))
+conf <- confusionMatrix(t)
+
+levelplot(sweep(conf$table, MARGIN = 2, STATS = colSums(conf$table), FUN = `/`), col.regions = gray(100:0/100), aspect="fill", scales=list( x=list(rot=45)))
+```
+
+
+### Neural Network
+```{r setup1, message=FALSE, results='hide'}
+train_model <- function(method, tuneGrid=NULL) {
+  train(x = training, # in real life apps only use train data here!
+        y = training_SNR, # in real life apps only use train data here!
+        method = method, 
+        metric = 'Kappa', 
+        tuneGrid = tuneGrid,
+        trControl = trControl
+  )
+}
+
+nnet_grid <- expand.grid(.decay = c(0.5, 0.1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7), .size = c(3, 5, 10, 20))
+models$nn <- train_model("nnet", tuneGrid = nnet_grid)
+
+```
+
+```{r display nn}
+print(models$nn)
+plot(models$nn, scales = list(x = list(log = 3)))
+levelplot(x = Kappa ~ size * decay, data = models$nn$results[models$nn$results$decay!=3 & models$nn$results$size != 1,], col.regions=gray(100:0/100), scales=list(y=list(log=3)))
+
+plot.nnet(models$nn$finalModel)
+```
+
+```{r predict_test_data nn}
+predicted <- predict(models$nn, newdata = testing)
+
+# to ensure, that also when one level is not predicted, the results can be displayed
+u = union(predicted, testing$pers)
+t = table(factor(predicted, u), factor(testing_SNR, u))
+conf <- confusionMatrix(t)
+
+levelplot(sweep(conf$table, MARGIN = 2, STATS = colSums(conf$table), FUN = `/`), col.regions = gray(100:0/100), aspect="fill", scales=list( x=list(rot=45)))
+```
+
+
+
+## Models' Results Comparison
+```{r result comparison}
+results <- resamples(models)
+summary(results)
+bwplot(results)
+```

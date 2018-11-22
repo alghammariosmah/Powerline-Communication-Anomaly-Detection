@@ -1,0 +1,62 @@
+---
+title: "trainDirectly"
+author: "alghammari"
+date: "27 Oktober 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r setup, message=FALSE, results='hide'}
+require(plyr)
+require(corrplot)
+require(caret)
+require(doMC)
+registerDoMC(4)
+require(zoo)
+# nnet plots: https://beckmw.wordpress.com/2013/11/14/visualizing-neural-networks-in-r-update/
+require(devtools)
+source_url('https://gist.githubusercontent.com/fawda123/7471137/raw/466c1474d0a505ff044412703516c34f1a4684a5/nnet_plot_update.r')
+```
+
+```{r read data}
+# Loading the txt (or CSV) file after saving the values from MATLAB data preprocessing methods
+filedir <- 'data/'
+
+files_load <- list.files(filedir, full.names = T, pattern="*.txt")
+
+
+appliance <- list()
+appliance$emg0 <- ldply(files_load[1], read.table, sep=',', fill = T, col.names = c('appliance', paste('HF_', 1:4097, sep='')))
+
+```
+
+### Feature Correlation
+We applied correlation threshold and filtered all but one feature of each group of features with correlation higher than threshold so ML algorithms can detect the exact feature of each HF SNR values for each appliance. Thus, we reduced amount of features, but kept a large portions of the information contained in the data. In other words, we  obtained less features, which still represent the same information.
+
+```{r feature correlation}
+# feature correlation as plot
+corrplot(cor(appliance$emg0[,2:100]), tl.cex = 0.3) 
+# remove correlated variable using ?findCorrelation
+foundCorIndexes <- findCorrelation(cor(appliance$emg0))
+#foundCorIndexes
+corrplot(cor(appliance$emg0[,-foundCorIndexes]), tl.cex = 0.3)
+# remove the features from the data
+appliance$emg0 <- appliance$emg0[,-foundCorIndexes]
+```
+
+## Data Partitioning
+
+```{r data_partitioning}
+# split into training and test data
+set.seed(1704)
+indexes_train <- createDataPartition(appliance$emg0[,1], p=0.75, list = F)
+indexes_test <- (1:nrow(appliance$emg0))[-indexes_train]
+
+training <- appliance$emg0[indexes_train,]
+training_SNR <- appliance$emg0[indexes_train,1]
+testing <- appliance$emg0[indexes_test,]
+testing_SNR <- appliance$emg0[indexes_test,1]
+```
